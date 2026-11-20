@@ -1,0 +1,9 @@
+{
+  "name": "nwc2midi",
+  "version": "0.1.0",
+  "description": "Convert NoteWorthy Composer .nwc files to MIDI",
+  "type": "module",
+  "bin": { "nwc2midi": "./bin/nwc2midi.mjs" },
+  "license": "GPL-2.0-only",
+  "engines": { "node": ">=18" }
+}

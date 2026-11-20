@@ -1,0 +1,405 @@
+// NWC File Parser
+import { BinaryReader, decodeString } from './reader.js';
+import { NWC_HEADER, NWZ_HEADER, NWC_Version, ObjType, isValidVersion } from './constants.js';
+import { createObject, NoteCMObj, RestCMObj } from './objects.js';
+
+// Resolve zlib for Node.js ESM (createRequire is sync-safe, unlike dynamic import)
+let _zlib = null;
+try {
+  if (typeof Bun !== 'undefined') {
+    _zlib = require('zlib');
+  } else if (typeof process !== 'undefined' && process.versions?.node) {
+    const { createRequire } = await import('module');
+    _zlib = createRequire(import.meta.url)('zlib');
+  }
+} catch { /* browser or other env */ }
+
+export class NWCStaff {
+  constructor(file) {
+    this.file = file;
+    this.name = ''; this.label = ''; this.group = '';
+    this.channel = 0; this.patchName = 0; this.endingBar = 0;
+    // Muted staves are notated but silent; files often pair them with a
+    // playback-only copy, so playing both would double every note.
+    this.muted = false;
+    // Displayed in the score (Page Setup > Contents). Hidden staves usually
+    // hold playback-only material; they still sound.
+    this.visible = true;
+    this.objects = []; this.lyrics = [];
+    this.transposition = 0;
+    // WithNextStaff grouping flags
+    this.bracketWithNext = false;
+    this.braceWithNext = false;
+    this.connectBarsWithNext = false;
+    this.layerWithNext = false;
+    // Vertical sizing
+    this.boundaryTop = 0; this.boundaryBottom = 0; this.lines = 5;
+    // Staff color (0=Default, 1=Red, 2=Green, 3=Blue)
+    this.color = 0;
+  }
+
+  getDivisions() {
+    let div = 1;
+    const gcd = (a, b) => b ? gcd(b, a % b) : a;
+    const lcm = (a, b) => a * b / gcd(a, b);
+    const process = obj => {
+      if (obj.getDivision) div = lcm(div, obj.getDivision());
+      if (obj.children) obj.children.forEach(process);
+    };
+    this.objects.forEach(process);
+    return div;
+  }
+}
+
+export class NWCFile {
+  constructor() {
+    this.version = 0; this.title = ''; this.author = ''; this.lyricist = '';
+    this.copyright1 = ''; this.copyright2 = ''; this.comment = '';
+    this.measureStart = 1; this.staffs = [];
+    this.allowLayering = true;
+    this.fonts = [];  // [{ name, bold, italic, size }] in NWC font style order
+    this.staffSize = 0; // staff height in points (Page Setup), 0 = unknown
+  }
+}
+
+import { parseNWCTxt } from './nwctxt-parser.js';
+
+export function parseNWC(buffer) {
+  let data = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  
+  // Check for compressed format
+  const header = String.fromCharCode(...data.slice(0, 5));
+  
+  if (header === NWZ_HEADER) {
+    data = decompress(data.slice(6));
+  }
+
+  // Plain-text .nwctxt file (NWC 2.5+ text export)
+  if (header === '!Note') return parseNWCTxt(decodeString(data));
+
+  const r = new BinaryReader(data);
+  
+  // Verify header
+  const hdr = String.fromCharCode(...r.readBytes(NWC_HEADER.length));
+  if (hdr !== NWC_HEADER) throw new Error('Invalid NWC file header');
+  
+  // Skip variable-length zero padding between header and version.
+  // Some files have extra 0x00 bytes here; the old parser used readUntilNonZero().
+  while (!r.eof() && r.buffer[r.pos] === 0) r.skip(1);
+  
+  const file = new NWCFile();
+  file.version = r.readInt16();
+  if (!isValidVersion(file.version)) throw new Error(`Unsupported NWC version: ${file.version.toString(16)}`);
+  
+  // V275 (0x24b) has embedded NWCTXT - find and parse it. NWC 2.75 writes it
+  // as UTF-8 (older exports may use the system codepage), so decode with the
+  // same detection as binary strings: UTF-8 first, then codepage heuristics.
+  if (file.version === NWC_Version.V275) {
+    const ascii = new TextDecoder('latin1').decode(data);
+    const idx = ascii.indexOf('!NoteWorthyComposer(');
+    if (idx >= 0) return parseNWCTxt(decodeString(data.subarray(idx)));
+  }
+  
+  // After version: 1 unknown byte, then variable zero padding, then two
+  // NUL-terminated strings (user, unknown).  The old parser used
+  // readBytes(1) + readUntilNonZero() + readString() for each field.
+  r.skip(1); // 1 unknown byte
+  // [nwc2midi] Some files store a small counter byte here (seen 0x02, 0x03)
+  // instead of zero padding; skip any non-printable bytes, not just zeros.
+  while (!r.eof() && r.buffer[r.pos] < 0x20) r.skip(1);
+  file.user = r.readStringNul();
+  while (!r.eof() && r.buffer[r.pos] === 0) r.skip(1); // skip zero padding
+  r.readStringNul(); // unknown string
+  if (file.version >= NWC_Version.V200) {
+    // 2.x: a 4-byte field (often but not always zero: 'a9 3c 00 00',
+    // 'd7 44 e4 04') and 4 reserved bytes follow directly, then the info
+    // header — skipping zero padding misreads files with a non-zero field
+    r.skip(8);
+  } else {
+    while (!r.eof() && r.buffer[r.pos] === 0) r.skip(1); // skip zero padding
+  }
+  r.readInt16(); // info header (e.g. 0x18 for NWC2, 0x20 for 2.05)
+  
+  file.title = r.readStringNul();
+  file.author = r.readStringNul();
+  if (file.version >= NWC_Version.V200) file.lyricist = r.readStringNul();
+  file.copyright1 = r.readStringNul();
+  file.copyright2 = r.readStringNul();
+  file.comment = r.readStringNul();
+  
+  r.skip(2); // extend/spacing
+  r.skip(5); // unknown
+  r.skip(1); // measure numbers
+  r.skip(1); // unknown
+  file.measureStart = r.readInt16();
+  
+  if (file.version >= NWC_Version.V130) {
+    r.readStringSpace(); r.readStringSpace(); r.readStringSpace(); r.readStringSpace(); // margins
+  }
+  r.skip(1); // mirror margin
+  r.skip(2); // btUnknown5
+  
+  if (file.version > NWC_Version.V130) {
+    // Page Setup > Contents: one bit per staff (index order) marking the
+    // staves shown in the score — NWC hides a staff by unchecking it.
+    file.staffVisibility = r.readBytes(32);
+    file.allowLayering = !!r.readUint8();
+  }
+  // Notation typeface only for V200+
+  if (file.version >= NWC_Version.V200) {
+    r.readStringNul(); // notation typeface
+  }
+  file.staffSize = r.readInt16(); // staff height in points; text font sizes are relative to it
+  
+  // Font info
+  let fontCount = 0;
+  if (file.version > NWC_Version.V130) fontCount = file.version <= NWC_Version.V170 ? 10 : 12;
+  // Font table in NWC style order (StaffItalic, StaffBold, StaffLyric,
+  // PageTitleText, PageText, PageSmallText, User1..User6): typeface, then
+  // style (0x01 bold, 0x02 italic), size in points, reserved, charset.
+  const readFont = () => {
+    const name = r.readStringNul();
+    const style = r.readUint8(), size = r.readUint8();
+    r.skip(2);
+    return { name, bold: !!(style & 1), italic: !!(style & 2), size };
+  };
+  for (let i = 0; i < fontCount; i++) file.fonts.push(readFont());
+  // Some V170 files have 12 fonts
+  if (file.version === NWC_Version.V170) {
+    const pos = r.tell();
+    const ch = r.readUint8();
+    r.seek(pos);
+    if (ch !== 0 && ch !== 0xFF) {
+      for (let i = 0; i < 2; i++) file.fonts.push(readFont());
+    }
+  }
+  
+  r.skip(1); // title page info
+  r.skip(1); // staff labels
+  r.skip(2); // start page no
+  // V205 has 14 extra bytes before the staff count. 2.0x files usually
+  // have one extra byte (0x00 or 0xFF) but not always (rosfang.nwc), so pick
+  // the reading whose count is plausible and is followed by a staff name.
+  if (file.version >= NWC_Version.V205) {
+    r.skip(14);
+  } else if (file.version >= NWC_Version.V200) {
+    const at = r.tell();
+    const plausible = (pos) => {
+      const count = r.buffer[pos] | (r.buffer[pos + 1] << 8);
+      const next = r.buffer[pos + 2];
+      return count > 0 && count <= 256 && (next === 0 || next >= 0x20);
+    };
+    if (!plausible(at) || plausible(at + 1)) r.skip(1);
+  }
+  const staffCount = r.readInt16();
+  
+  for (let i = 0; i < staffCount; i++) {
+    const staff = loadStaff(r, file);
+    if (file.staffVisibility) staff.visible = !!(file.staffVisibility[i >> 3] & (1 << (i & 7)));
+    file.staffs.push(staff);
+  }
+  
+  return file;
+}
+
+function loadStaff(r, file) {
+  const staff = new NWCStaff(file);
+  staff.name = r.readStringNul();
+  if (file.version >= NWC_Version.V200) {
+    staff.label = r.readStringNul();
+    staff.instName = r.readStringNul(); // [nwc2midi] keep instrument name
+    if (file.version >= NWC_Version.V205) r.readStringNul(); // extra string in V205
+  }
+  staff.group = r.readStringNul();
+  
+  // Staff info - exact byte layout per version (matching C++ structs)
+  staff.endingBar = r.readUint8();
+  staff.muted = !!(r.readUint8() & 1);
+  r.skip(1); // reserved1
+  staff.channel = r.readUint8();
+  r.skip(1); // reserved2
+  r.skip(1); // playback device
+  r.skip(1); // reserved3
+  r.skip(1); // select patch bank
+  r.skip(3); // reserved4[3]
+  // [nwc2midi] Binary files store the GM patch 1-based, 0 meaning "no patch
+  // set" (verified against the instrument names stored in 2.0x files and the
+  // patch embedded in Instrument objects). Normalise to 0-based.
+  { const rawPatch = r.readUint8(); staff.patchUnset = rawPatch === 0; staff.patchName = Math.max(rawPatch - 1, 0); }
+  
+  // V155+ adds reserved5 (1 byte) after patchName
+  if (file.version >= NWC_Version.V155) r.skip(1);
+  // V200+ adds defaultDynamicVelocity[8] after reserved5
+  // [nwc2midi] keep them (ppp..fff); older files use NWC's defaults
+  staff.dynamicVelocity = [10, 30, 45, 60, 75, 92, 108, 127];
+  if (file.version >= NWC_Version.V200) staff.dynamicVelocity = Array.from(r.readBytes(8));
+  
+  // Staff visual type — pre-V200 encodes staff grouping in this byte:
+  //   0 = Standard, 1 = Upper Grand Staff, 2 = Lower Grand Staff, 3 = Orchestral
+  // V200+ moved to explicit withNext bitmask (style byte becomes independent).
+  var staffType = r.readUint8();
+  r.skip(1); // second style byte (reserved / padding)
+  staff.boundaryTop = r.readInt16();
+  staff.boundaryBottom = r.readInt16();
+  
+  // V175+ adds lines (1 byte) after vertical size lower
+  if (file.version >= NWC_Version.V175) staff.lines = r.readUint8();
+  
+  var withNext = r.readUint16();
+
+  // Staff type drives grouping in every binary version (verified against the
+  // NWC viewer: albadagio strings = Orchestral → bracket, organ = Grand Staff
+  // → brace). withNext bit 0 is "layer with next staff" — files name the
+  // following staff "X layer", "RH 1", etc. Other withNext bits are never set
+  // in binary files; 2.75 nwctxt carries Bracket/Brace/ConnectBars explicitly.
+  if (staffType === 1) {
+    staff.braceWithNext = true;
+    staff.connectBarsWithNext = true;
+  } else if (staffType === 3) {
+    staff.bracketWithNext = true;
+  }
+  staff.layerWithNext = !!(withNext & 0x01);
+
+  // V150+ adds transposition (2 bytes, signed — semitones above/below written pitch)
+  if (file.version >= NWC_Version.V150) staff.transposition = r.readInt16();
+  else staff.transposition = 0;
+  
+  staff.volume = r.readUint16(); // [nwc2midi] part volume (CC7), was skipped
+  staff.pan = r.readUint16();    // [nwc2midi] stereo pan (CC10), was skipped
+  
+  // Version-specific ending before numLyric:
+  // V130: reserved6(1) + color(1) + numLyric(2)
+  // V150: reserved6(1) + color(1) + numLyric(2)
+  // V155: reserved6(1) + color(1) + numLyric(2)
+  // V170: color(1) + reserved6(2) + numLyric(2)
+  // V175+: color(1) + alignSyllable(2) + numLyric(2)
+  if (file.version <= NWC_Version.V155) {
+    r.skip(1); // reserved6
+    staff.color = r.readUint8() & 3;
+  } else {
+    staff.color = r.readUint8() & 3;
+    r.skip(2); // reserved6 (V170) or alignSyllable (V175+)
+  }
+  
+  let numLyric = r.readInt16();
+  // Handle corrupted numLyric (0xCDCD)
+  if ((numLyric & 0xFFFF) === 0xCDCD) numLyric = 0;
+  
+  // V150+ reads alignment(2) + staffOffset(2) if numLyric > 0
+  if (numLyric > 0 && file.version >= NWC_Version.V150) r.skip(4);
+  
+  // Load lyrics
+  for (let i = 0; i < numLyric; i++) {
+    const blockSize = r.readInt16();
+    if (blockSize > 0) {
+      r.skip(2); // lyric size
+      const start = r.tell(); // save position AFTER lyric size
+      r.skip(2); // reserved
+      const syllables = [];
+      while (true) {
+        const s = r.readStringNul();
+        if (!s) break;
+        syllables.push(s);
+      }
+      staff.lyrics.push(syllables);
+      r.seek(start + blockSize);
+    } else {
+      staff.lyrics.push([]);
+    }
+  }
+  
+  // Load objects
+  if (numLyric > 0) r.skip(2); // unknown
+  r.skip(2); // unknown
+  let objCount = r.readInt16();
+  
+  // V150+ subtracts 2 from object count (not just V200+), V205 included
+  if (file.version > NWC_Version.V150) objCount -= 2;
+  
+  function loadWithChildren(r, staff) {
+    const obj = loadObject(r, staff);
+    if (obj && (obj instanceof NoteCMObj || obj instanceof RestCMObj)) {
+      for (let j = 0; j < obj.count; j++) {
+        const child = loadWithChildren(r, staff);
+        if (child) obj.children.push(child);
+      }
+    }
+    return obj;
+  }
+  
+  for (let i = 0; i < objCount; i++) {
+    const obj = loadWithChildren(r, staff);
+    if (obj) staff.objects.push(obj);
+  }
+  // V205 can store a few more objects than counted (seen: the closing
+  // barline). Objects start with a type byte <= 23 then 0x00; the next staff
+  // starts with its printable name, so read on while the bytes look like one.
+  if (file.version >= NWC_Version.V205) {
+    while (r.remaining >= 2 && r.buffer[r.pos] <= 23 && r.buffer[r.pos + 1] === 0) {
+      const obj = loadWithChildren(r, staff);
+      if (!obj) break;
+      staff.objects.push(obj);
+    }
+  }
+  
+  // Check if we need to read 2 more objects (when last object was NoteCM/RestCM)
+  // This handles a quirk where the -2 subtraction is incorrect for some staffs
+  if (file.version > NWC_Version.V150 && file.version < NWC_Version.V205 && !r.eof() && staff.objects.length > 0) {
+    const lastObj = staff.objects[staff.objects.length - 1];
+    const hasChildren = lastObj instanceof NoteCMObj || lastObj instanceof RestCMObj;
+    if (hasChildren) {
+      // Check if next bytes look like valid object types (0-18)
+      const nextType = r.buffer[r.tell()] | (r.buffer[r.tell() + 1] << 8);
+      if (nextType >= 0 && nextType <= 18) {
+        // Try to read 2 more objects
+        for (let i = 0; i < 2 && !r.eof(); i++) {
+          const pos = r.tell();
+          const peekType = r.buffer[pos] | (r.buffer[pos + 1] << 8);
+          if (peekType < 0 || peekType > 18) break;
+          
+          const obj = loadObject(r, staff);
+          if (obj) {
+            staff.objects.push(obj);
+            if (obj instanceof NoteCMObj || obj instanceof RestCMObj) {
+              for (let j = 0; j < obj.count; j++) {
+                const child = loadObject(r, staff);
+                if (child) obj.children.push(child);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  return staff;
+}
+
+function loadObject(r, staff) {
+  // V205+ uses 1-byte type + 1-byte skip, older versions use 2-byte type (int16)
+  const version = staff.file?.version || 0;
+  const type = version >= NWC_Version.V205 ? r.readUint8() : r.readInt16();
+  if (version >= NWC_Version.V205) r.skip(1); // skip byte after type
+  
+  const obj = createObject(type, staff);
+  if (!obj) throw new Error(`Unknown object type: ${type} at ${r.tell().toString(16)}`);
+  obj.load(r);
+  return obj;
+}
+
+function decompress(data) {
+  // Use pre-resolved zlib for Bun / Node.js
+  if (_zlib) {
+    return new Uint8Array(_zlib.inflateSync(Buffer.from(data)));
+  }
+  // Browser - use Zlib from inflate.js (already loaded)
+  if (typeof Zlib !== 'undefined' && Zlib.Inflate) {
+    const inflate = new Zlib.Inflate(data);
+    return inflate.decompress();
+  }
+  // Browser - use pako if available
+  if (typeof globalThis.pako !== 'undefined') {
+    return globalThis.pako.inflate(data);
+  }
+  throw new Error('No decompression library available');
+}

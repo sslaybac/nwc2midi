@@ -1,0 +1,98 @@
+diff -ru nwc2xml/objects.js nwc2xml/objects.js
+--- nwc2xml/objects.js	2026-11-19 15:59:30.500647132 -0800
++++ nwc2xml/objects.js	2026-11-19 16:00:08.422263897 -0800
+@@ -68,9 +68,15 @@
+   constructor(s) { super(ObjType.Instrument, s); this.name = ''; }
+   load(r) {
+     super.load(r);
++    // [nwc2midi] decode the patch: byte 6 of the fixed part, 1-based (0 = none).
++    // Verified against the instrument names stored in 2.0x files.
++    const at = r.tell();
+     if (this.version < NWC_Version.V170) r.skip(6);
+     else if (this.version < NWC_Version.V200) r.skip(8);
+-    else { r.skip(8); this.name = r.readStringNul(); r.skip(9); }
++    else { r.skip(8); this.name = r.readStringNul(); r.skip(1); this.dynamicVelocity = Array.from(r.readBytes(8)); }
++    const rawPatch = this.version >= NWC_Version.V170 ? r.buffer[at + 6] : 0;
++    this.patchUnset = rawPatch === 0;
++    this.patch = Math.max(rawPatch - 1, 0);
+   }
+ }
+ 
+@@ -291,7 +297,22 @@
+   load(r) {
+     super.load(r);
+     this.pos = r.readInt8(); this.placement = r.readUint8();
+-    r.skip(this.version <= NWC_Version.V155 ? 0x1E : 32);
++    if (this.version <= NWC_Version.V155) { r.skip(0x1E); this.points = []; return; }
++    // [nwc2midi] decode the 32-byte body (layout inferred from real files):
++    //   u16 controller (0 tempo, 1 volume, 4 pitch bend; others unverified)
++    //   u16 style (0 absolute, 1 linear sweep)
++    //   u16 time resolution (0 whole, 1 half, 2 quarter, 3 eighth, ...)
++    //   u16 sweep resolution (steps per time unit)
++    //   4 points x { u16 used, u16 time delta in resolution units, u16 value }
++    this.controller = r.readUint16();
++    this.style = r.readUint16();
++    this.timeRes = r.readUint16();
++    this.sweepRes = r.readUint16();
++    this.points = [];
++    for (let i = 0; i < 4; i++) {
++      const used = r.readUint16(), delta = r.readUint16(), value = r.readUint16();
++      if (used) this.points.push({ delta, value });
++    }
+   }
+ }
+ 
+diff -ru nwc2xml/parser.js nwc2xml/parser.js
+--- nwc2xml/parser.js	2026-11-19 15:59:30.500660965 -0800
++++ nwc2xml/parser.js	2026-11-19 16:00:08.422177329 -0800
+@@ -104,7 +104,9 @@
+   // NUL-terminated strings (user, unknown).  The old parser used
+   // readBytes(1) + readUntilNonZero() + readString() for each field.
+   r.skip(1); // 1 unknown byte
+-  while (!r.eof() && r.buffer[r.pos] === 0) r.skip(1); // skip zero padding
++  // [nwc2midi] Some files store a small counter byte here (seen 0x02, 0x03)
++  // instead of zero padding; skip any non-printable bytes, not just zeros.
++  while (!r.eof() && r.buffer[r.pos] < 0x20) r.skip(1);
+   file.user = r.readStringNul();
+   while (!r.eof() && r.buffer[r.pos] === 0) r.skip(1); // skip zero padding
+   r.readStringNul(); // unknown string
+@@ -205,7 +207,7 @@
+   staff.name = r.readStringNul();
+   if (file.version >= NWC_Version.V200) {
+     staff.label = r.readStringNul();
+-    r.readStringNul(); // instName
++    staff.instName = r.readStringNul(); // [nwc2midi] keep instrument name
+     if (file.version >= NWC_Version.V205) r.readStringNul(); // extra string in V205
+   }
+   staff.group = r.readStringNul();
+@@ -220,12 +222,17 @@
+   r.skip(1); // reserved3
+   r.skip(1); // select patch bank
+   r.skip(3); // reserved4[3]
+-  staff.patchName = r.readUint8();
++  // [nwc2midi] Binary files store the GM patch 1-based, 0 meaning "no patch
++  // set" (verified against the instrument names stored in 2.0x files and the
++  // patch embedded in Instrument objects). Normalise to 0-based.
++  { const rawPatch = r.readUint8(); staff.patchUnset = rawPatch === 0; staff.patchName = Math.max(rawPatch - 1, 0); }
+   
+   // V155+ adds reserved5 (1 byte) after patchName
+   if (file.version >= NWC_Version.V155) r.skip(1);
+   // V200+ adds defaultDynamicVelocity[8] after reserved5
+-  if (file.version >= NWC_Version.V200) r.skip(8);
++  // [nwc2midi] keep them (ppp..fff); older files use NWC's defaults
++  staff.dynamicVelocity = [10, 30, 45, 60, 75, 92, 108, 127];
++  if (file.version >= NWC_Version.V200) staff.dynamicVelocity = Array.from(r.readBytes(8));
+   
+   // Staff visual type — pre-V200 encodes staff grouping in this byte:
+   //   0 = Standard, 1 = Upper Grand Staff, 2 = Lower Grand Staff, 3 = Orchestral
+@@ -257,8 +264,8 @@
+   if (file.version >= NWC_Version.V150) staff.transposition = r.readInt16();
+   else staff.transposition = 0;
+   
+-  r.skip(2); // part volume
+-  r.skip(2); // stereo pan
++  staff.volume = r.readUint16(); // [nwc2midi] part volume (CC7), was skipped
++  staff.pan = r.readUint16();    // [nwc2midi] stereo pan (CC10), was skipped
+   
+   // Version-specific ending before numLyric:
+   // V130: reserved6(1) + color(1) + numLyric(2)
