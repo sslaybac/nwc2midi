@@ -32,6 +32,27 @@ Options:
 Each file prints a summary line (format version, staves, muted staves, notes) and
 any warnings about notation that could not be played back.
 
+### Rendering MIDI to MP3
+
+```sh
+bin/midi2mp3.sh [--artist NAME] [--jobs N] <soundfont.sf2> <midi-dir> <mp3-dir>
+```
+
+This renders every `.mid` under `<midi-dir>` and mirrors the folders under
+`<mp3-dir>`. Each file goes through these steps:
+
+1. FluidSynth renders it to 32-bit float WAV at 44.1 kHz with gain 1.0, so
+   nothing clips.
+2. SoX trims trailing silence below −80 dB to 1 second and normalises the peak
+   to −1 dBFS.
+3. LAME encodes it as VBR `-V2`.
+
+ID3 tags: the title is the file name, the album is the top-level folder, and the
+artist is `--artist`. It requires `fluidsynth`, `sox` and `lame`.
+
+Each FluidSynth process loads the whole SoundFont, so with a large SoundFont,
+keep `--jobs` × SoundFont size within free memory.
+
 ## What is converted
 
 - Notes, chords and rests, with dots, double dots and triplets; whole rests fill the bar.
